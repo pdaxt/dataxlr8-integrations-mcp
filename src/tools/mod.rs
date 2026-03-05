@@ -1,4 +1,4 @@
-use dataxlr8_mcp_core::mcp::{empty_schema, error_result, get_bool, get_i64, get_str, json_result, make_schema};
+use dataxlr8_mcp_core::mcp::{error_result, get_i64, get_str, json_result, make_schema};
 use dataxlr8_mcp_core::Database;
 use rmcp::model::*;
 use rmcp::service::{RequestContext, RoleServer};
@@ -46,10 +46,58 @@ pub struct IntegrationSummary {
 }
 
 // ============================================================================
-// Tool definitions
+// Constants & validation helpers
 // ============================================================================
 
 const VALID_PLATFORMS: &[&str] = &["linkedin", "seek", "indeed", "xing"];
+const DEFAULT_LIMIT: i64 = 50;
+const DEFAULT_OFFSET: i64 = 0;
+const MAX_LIMIT: i64 = 500;
+
+/// Clamp limit to [1, MAX_LIMIT], defaulting to `default`.
+fn clamp_limit(args: &serde_json::Value, key: &str, default: i64) -> i64 {
+    get_i64(args, key).unwrap_or(default).clamp(1, MAX_LIMIT)
+}
+
+/// Clamp offset to >= 0, defaulting to 0.
+fn clamp_offset(args: &serde_json::Value) -> i64 {
+    get_i64(args, "offset").unwrap_or(DEFAULT_OFFSET).max(0)
+}
+
+/// Extract and trim a required string parameter. Returns Err(CallToolResult) on missing/empty.
+fn require_trimmed_str(args: &serde_json::Value, key: &str) -> Result<String, CallToolResult> {
+    match get_str(args, key) {
+        Some(s) => {
+            let trimmed = s.trim().to_string();
+            if trimmed.is_empty() {
+                Err(error_result(&format!("Parameter '{}' must not be empty", key)))
+            } else {
+                Ok(trimmed)
+            }
+        }
+        None => Err(error_result(&format!("Missing required parameter: {}", key))),
+    }
+}
+
+/// Extract and validate a required JSON object parameter.
+fn require_json_object(args: &serde_json::Value, key: &str) -> Result<serde_json::Value, CallToolResult> {
+    match args.get(key) {
+        Some(v) if v.is_object() => {
+            let obj = v.as_object().unwrap();
+            if obj.is_empty() {
+                Err(error_result(&format!("Parameter '{}' must be a non-empty JSON object", key)))
+            } else {
+                Ok(v.clone())
+            }
+        }
+        Some(_) => Err(error_result(&format!("Parameter '{}' must be a JSON object", key))),
+        None => Err(error_result(&format!("Missing required parameter: {}", key))),
+    }
+}
+
+// ============================================================================
+// Tool definitions
+// ============================================================================
 
 fn build_tools() -> Vec<Tool> {
     vec![
@@ -78,10 +126,16 @@ fn build_tools() -> Vec<Tool> {
             name: "list_integrations".into(),
             title: None,
             description: Some(
-                "Show all configured integrations and their status. Credentials are redacted."
+                "Show all configured integrations and their status. Credentials are redacted. Supports pagination via limit/offset."
                     .into(),
             ),
-            input_schema: empty_schema(),
+            input_schema: make_schema(
+                serde_json::json!({
+                    "limit": { "type": "integer", "description": "Max results to return (default: 50, max: 500)" },
+                    "offset": { "type": "integer", "description": "Number of results to skip (default: 0)" }
+                }),
+                vec![],
+            ),
             output_schema: None,
             annotations: None,
             execution: None,
@@ -98,7 +152,7 @@ fn build_tools() -> Vec<Tool> {
             input_schema: make_schema(
                 serde_json::json!({
                     "platform": { "type": "string", "enum": ["linkedin", "seek", "indeed", "xing"], "description": "Platform to sync from" },
-                    "limit": { "type": "integer", "description": "Max records to sync (default: 100)" }
+                    "limit": { "type": "integer", "description": "Max records to sync (default: 50, max: 500)" }
                 }),
                 vec!["platform"],
             ),
@@ -151,13 +205,14 @@ fn build_tools() -> Vec<Tool> {
             name: "integration_log".into(),
             title: None,
             description: Some(
-                "Show sync history for an integration. Returns recent sync log entries."
+                "Show sync history for an integration. Returns recent sync log entries with pagination."
                     .into(),
             ),
             input_schema: make_schema(
                 serde_json::json!({
                     "platform": { "type": "string", "enum": ["linkedin", "seek", "indeed", "xing"], "description": "Platform to view logs for" },
-                    "limit": { "type": "integer", "description": "Max log entries to return (default: 20)" }
+                    "limit": { "type": "integer", "description": "Max log entries to return (default: 50, max: 500)" },
+                    "offset": { "type": "integer", "description": "Number of entries to skip (default: 0)" }
                 }),
                 vec!["platform"],
             ),
@@ -235,20 +290,24 @@ impl IntegrationsMcpServer {
         }
     }
 
+    /// Extract, trim, and validate a platform parameter from args.
+    fn require_platform(args: &serde_json::Value) -> Result<String, CallToolResult> {
+        let platform = require_trimmed_str(args, "platform")?;
+        Self::validate_platform(&platform)?;
+        Ok(platform)
+    }
+
     // ---- Tool handlers ----
 
     async fn handle_configure_integration(&self, args: &serde_json::Value) -> CallToolResult {
-        let platform = match get_str(args, "platform") {
-            Some(p) => p,
-            None => return error_result("Missing required parameter: platform"),
+        let platform = match Self::require_platform(args) {
+            Ok(p) => p,
+            Err(e) => return e,
         };
-        if let Err(e) = Self::validate_platform(&platform) {
-            return e;
-        }
 
-        let credentials = match args.get("credentials") {
-            Some(c) if c.is_object() => c.clone(),
-            _ => return error_result("Missing or invalid required parameter: credentials (must be a JSON object)"),
+        let credentials = match require_json_object(args, "credentials") {
+            Ok(c) => c,
+            Err(e) => return e,
         };
 
         let field_mapping = args
@@ -280,8 +339,7 @@ impl IntegrationsMcpServer {
         .await
         {
             Ok(config) => {
-                info!(platform = platform, "Configured integration");
-                // Return summary (redact credentials)
+                info!(platform = %platform, "Configured integration");
                 json_result(&IntegrationSummary {
                     id: config.id,
                     platform: config.platform,
@@ -292,19 +350,30 @@ impl IntegrationsMcpServer {
                     created_at: config.created_at,
                 })
             }
-            Err(e) => error_result(&format!("Failed to configure integration: {e}")),
+            Err(e) => {
+                error!(platform = %platform, error = %e, "Failed to configure integration");
+                error_result(&format!("Failed to configure integration: {e}"))
+            }
         }
     }
 
-    async fn handle_list_integrations(&self) -> CallToolResult {
+    async fn handle_list_integrations(&self, args: &serde_json::Value) -> CallToolResult {
+        let limit = clamp_limit(args, "limit", DEFAULT_LIMIT);
+        let offset = clamp_offset(args);
+
         let configs: Vec<IntegrationConfig> = match sqlx::query_as(
-            "SELECT * FROM integrations.configs ORDER BY platform",
+            "SELECT * FROM integrations.configs ORDER BY platform LIMIT $1 OFFSET $2",
         )
+        .bind(limit)
+        .bind(offset)
         .fetch_all(self.db.pool())
         .await
         {
             Ok(c) => c,
-            Err(e) => return error_result(&format!("Database error: {e}")),
+            Err(e) => {
+                error!(error = %e, "Failed to list integrations");
+                return error_result(&format!("Database error: {e}"));
+            }
         };
 
         let summaries: Vec<IntegrationSummary> = configs
@@ -323,19 +392,21 @@ impl IntegrationsMcpServer {
             })
             .collect();
 
-        json_result(&summaries)
+        json_result(&serde_json::json!({
+            "integrations": summaries,
+            "count": summaries.len(),
+            "limit": limit,
+            "offset": offset
+        }))
     }
 
     async fn handle_sync_contacts(&self, args: &serde_json::Value) -> CallToolResult {
-        let platform = match get_str(args, "platform") {
-            Some(p) => p,
-            None => return error_result("Missing required parameter: platform"),
+        let platform = match Self::require_platform(args) {
+            Ok(p) => p,
+            Err(e) => return e,
         };
-        if let Err(e) = Self::validate_platform(&platform) {
-            return e;
-        }
 
-        let limit = get_i64(args, "limit").unwrap_or(100);
+        let limit = clamp_limit(args, "limit", DEFAULT_LIMIT);
 
         // Verify integration exists and is active
         let config: Option<IntegrationConfig> = match sqlx::query_as(
@@ -346,17 +417,19 @@ impl IntegrationsMcpServer {
         .await
         {
             Ok(c) => c,
-            Err(e) => return error_result(&format!("Database error: {e}")),
+            Err(e) => {
+                error!(platform = %platform, error = %e, "Failed to fetch integration config for sync");
+                return error_result(&format!("Database error: {e}"));
+            }
         };
 
         let config = match config {
             Some(c) if c.active => c,
-            Some(_) => return error_result(&format!("Integration '{platform}' is disabled")),
-            None => return error_result(&format!("Integration '{platform}' not configured. Use configure_integration first.")),
+            Some(_) => return error_result(&format!("Integration '{}' is disabled", platform)),
+            None => return error_result(&format!("Integration '{}' not configured. Use configure_integration first.", platform)),
         };
 
-        // Simulate sync — in production this would call the platform's API
-        // For now, record the sync attempt
+        // Simulate sync -- in production this would call the platform's API
         let sync_id = uuid::Uuid::new_v4().to_string();
         let details = format!("Pull sync requested for up to {} contacts from {}", limit, platform);
 
@@ -372,13 +445,15 @@ impl IntegrationsMcpServer {
         .await
         {
             Ok(log) => {
-                // Update last_sync on the config
-                let _ = sqlx::query("UPDATE integrations.configs SET last_sync = now(), updated_at = now() WHERE id = $1")
+                if let Err(e) = sqlx::query("UPDATE integrations.configs SET last_sync = now(), updated_at = now() WHERE id = $1")
                     .bind(&config.id)
                     .execute(self.db.pool())
-                    .await;
+                    .await
+                {
+                    error!(config_id = %config.id, error = %e, "Failed to update last_sync timestamp");
+                }
 
-                info!(platform = platform, "Sync contacts initiated");
+                info!(platform = %platform, limit = limit, "Sync contacts initiated");
                 json_result(&serde_json::json!({
                     "status": "sync_initiated",
                     "platform": platform,
@@ -387,22 +462,22 @@ impl IntegrationsMcpServer {
                     "note": "Connect platform API adapter to perform actual data pull"
                 }))
             }
-            Err(e) => error_result(&format!("Failed to record sync: {e}")),
+            Err(e) => {
+                error!(platform = %platform, error = %e, "Failed to record sync");
+                error_result(&format!("Failed to record sync: {e}"))
+            }
         }
     }
 
     async fn handle_push_candidate(&self, args: &serde_json::Value) -> CallToolResult {
-        let platform = match get_str(args, "platform") {
-            Some(p) => p,
-            None => return error_result("Missing required parameter: platform"),
+        let platform = match Self::require_platform(args) {
+            Ok(p) => p,
+            Err(e) => return e,
         };
-        if let Err(e) = Self::validate_platform(&platform) {
-            return e;
-        }
 
-        let candidate = match args.get("candidate") {
-            Some(c) if c.is_object() => c.clone(),
-            _ => return error_result("Missing or invalid required parameter: candidate (must be a JSON object)"),
+        let candidate = match require_json_object(args, "candidate") {
+            Ok(c) => c,
+            Err(e) => return e,
         };
 
         // Verify integration exists and is active
@@ -414,12 +489,15 @@ impl IntegrationsMcpServer {
         .await
         {
             Ok(c) => c,
-            Err(e) => return error_result(&format!("Database error: {e}")),
+            Err(e) => {
+                error!(platform = %platform, error = %e, "Failed to fetch integration config for push");
+                return error_result(&format!("Database error: {e}"));
+            }
         };
 
         let config = match config {
             Some(c) => c,
-            None => return error_result(&format!("Integration '{platform}' not configured or disabled")),
+            None => return error_result(&format!("Integration '{}' not configured or disabled", platform)),
         };
 
         // Record the push attempt
@@ -427,6 +505,7 @@ impl IntegrationsMcpServer {
         let candidate_name = candidate
             .get("name")
             .and_then(|v| v.as_str())
+            .map(|s| s.trim())
             .unwrap_or("unknown");
         let details = format!("Push candidate '{}' to {}", candidate_name, platform);
 
@@ -442,12 +521,15 @@ impl IntegrationsMcpServer {
         .await
         {
             Ok(log) => {
-                let _ = sqlx::query("UPDATE integrations.configs SET last_sync = now(), updated_at = now() WHERE id = $1")
+                if let Err(e) = sqlx::query("UPDATE integrations.configs SET last_sync = now(), updated_at = now() WHERE id = $1")
                     .bind(&config.id)
                     .execute(self.db.pool())
-                    .await;
+                    .await
+                {
+                    error!(config_id = %config.id, error = %e, "Failed to update last_sync timestamp");
+                }
 
-                info!(platform = platform, candidate = candidate_name, "Push candidate initiated");
+                info!(platform = %platform, candidate = candidate_name, "Push candidate initiated");
                 json_result(&serde_json::json!({
                     "status": "push_initiated",
                     "platform": platform,
@@ -456,24 +538,31 @@ impl IntegrationsMcpServer {
                     "note": "Connect platform API adapter to perform actual push"
                 }))
             }
-            Err(e) => error_result(&format!("Failed to record push: {e}")),
+            Err(e) => {
+                error!(platform = %platform, error = %e, "Failed to record push");
+                error_result(&format!("Failed to record push: {e}"))
+            }
         }
     }
 
-    async fn handle_check_status(&self, platform: &str) -> CallToolResult {
-        if let Err(e) = Self::validate_platform(platform) {
-            return e;
-        }
+    async fn handle_check_status(&self, args: &serde_json::Value) -> CallToolResult {
+        let platform = match Self::require_platform(args) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
 
         let config: Option<IntegrationConfig> = match sqlx::query_as(
             "SELECT * FROM integrations.configs WHERE platform = $1",
         )
-        .bind(platform)
+        .bind(&platform)
         .fetch_optional(self.db.pool())
         .await
         {
             Ok(c) => c,
-            Err(e) => return error_result(&format!("Database error: {e}")),
+            Err(e) => {
+                error!(platform = %platform, error = %e, "Failed to check integration status");
+                return error_result(&format!("Database error: {e}"));
+            }
         };
 
         match config {
@@ -501,51 +590,52 @@ impl IntegrationsMcpServer {
     }
 
     async fn handle_integration_log(&self, args: &serde_json::Value) -> CallToolResult {
-        let platform = match get_str(args, "platform") {
-            Some(p) => p,
-            None => return error_result("Missing required parameter: platform"),
+        let platform = match Self::require_platform(args) {
+            Ok(p) => p,
+            Err(e) => return e,
         };
-        if let Err(e) = Self::validate_platform(&platform) {
-            return e;
-        }
 
-        let limit = get_i64(args, "limit").unwrap_or(20);
+        let limit = clamp_limit(args, "limit", DEFAULT_LIMIT);
+        let offset = clamp_offset(args);
 
         let logs: Vec<SyncLogEntry> = match sqlx::query_as(
             r#"SELECT sl.* FROM integrations.sync_log sl
                JOIN integrations.configs c ON sl.config_id = c.id
                WHERE c.platform = $1
                ORDER BY sl.synced_at DESC
-               LIMIT $2"#,
+               LIMIT $2 OFFSET $3"#,
         )
         .bind(&platform)
         .bind(limit)
+        .bind(offset)
         .fetch_all(self.db.pool())
         .await
         {
             Ok(l) => l,
-            Err(e) => return error_result(&format!("Database error: {e}")),
+            Err(e) => {
+                error!(platform = %platform, error = %e, "Failed to fetch integration logs");
+                return error_result(&format!("Database error: {e}"));
+            }
         };
 
         json_result(&serde_json::json!({
             "platform": platform,
-            "total_entries": logs.len(),
+            "count": logs.len(),
+            "limit": limit,
+            "offset": offset,
             "logs": logs
         }))
     }
 
     async fn handle_map_fields(&self, args: &serde_json::Value) -> CallToolResult {
-        let platform = match get_str(args, "platform") {
-            Some(p) => p,
-            None => return error_result("Missing required parameter: platform"),
+        let platform = match Self::require_platform(args) {
+            Ok(p) => p,
+            Err(e) => return e,
         };
-        if let Err(e) = Self::validate_platform(&platform) {
-            return e;
-        }
 
-        let mapping = match args.get("mapping") {
-            Some(m) if m.is_object() => m.clone(),
-            _ => return error_result("Missing or invalid required parameter: mapping (must be a JSON object)"),
+        let mapping = match require_json_object(args, "mapping") {
+            Ok(m) => m,
+            Err(e) => return e,
         };
 
         match sqlx::query_as::<_, IntegrationConfig>(
@@ -560,41 +650,48 @@ impl IntegrationsMcpServer {
         .await
         {
             Ok(Some(config)) => {
-                info!(platform = platform, "Updated field mapping");
+                info!(platform = %platform, "Updated field mapping");
                 json_result(&serde_json::json!({
                     "platform": config.platform,
                     "field_mapping": config.field_mapping,
                     "updated": true
                 }))
             }
-            Ok(None) => error_result(&format!("Integration '{platform}' not configured. Use configure_integration first.")),
-            Err(e) => error_result(&format!("Failed to update field mapping: {e}")),
+            Ok(None) => error_result(&format!("Integration '{}' not configured. Use configure_integration first.", platform)),
+            Err(e) => {
+                error!(platform = %platform, error = %e, "Failed to update field mapping");
+                error_result(&format!("Failed to update field mapping: {e}"))
+            }
         }
     }
 
-    async fn handle_disable_integration(&self, platform: &str) -> CallToolResult {
-        if let Err(e) = Self::validate_platform(platform) {
-            return e;
-        }
+    async fn handle_disable_integration(&self, args: &serde_json::Value) -> CallToolResult {
+        let platform = match Self::require_platform(args) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
 
         match sqlx::query("UPDATE integrations.configs SET active = false, updated_at = now() WHERE platform = $1")
-            .bind(platform)
+            .bind(&platform)
             .execute(self.db.pool())
             .await
         {
             Ok(r) => {
                 if r.rows_affected() > 0 {
-                    info!(platform = platform, "Disabled integration");
+                    info!(platform = %platform, "Disabled integration");
                     json_result(&serde_json::json!({
                         "platform": platform,
                         "active": false,
                         "disabled": true
                     }))
                 } else {
-                    error_result(&format!("Integration '{platform}' not configured"))
+                    error_result(&format!("Integration '{}' not configured", platform))
                 }
             }
-            Err(e) => error_result(&format!("Failed to disable integration: {e}")),
+            Err(e) => {
+                error!(platform = %platform, error = %e, "Failed to disable integration");
+                error_result(&format!("Failed to disable integration: {e}"))
+            }
         }
     }
 }
@@ -643,23 +740,13 @@ impl ServerHandler for IntegrationsMcpServer {
 
             let result = match name_str {
                 "configure_integration" => self.handle_configure_integration(&args).await,
-                "list_integrations" => self.handle_list_integrations().await,
+                "list_integrations" => self.handle_list_integrations(&args).await,
                 "sync_contacts" => self.handle_sync_contacts(&args).await,
                 "push_candidate" => self.handle_push_candidate(&args).await,
-                "check_status" => {
-                    match get_str(&args, "platform") {
-                        Some(p) => self.handle_check_status(&p).await,
-                        None => error_result("Missing required parameter: platform"),
-                    }
-                }
+                "check_status" => self.handle_check_status(&args).await,
                 "integration_log" => self.handle_integration_log(&args).await,
                 "map_fields" => self.handle_map_fields(&args).await,
-                "disable_integration" => {
-                    match get_str(&args, "platform") {
-                        Some(p) => self.handle_disable_integration(&p).await,
-                        None => error_result("Missing required parameter: platform"),
-                    }
-                }
+                "disable_integration" => self.handle_disable_integration(&args).await,
                 _ => error_result(&format!("Unknown tool: {}", request.name)),
             };
 
