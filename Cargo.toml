@@ -5,6 +5,10 @@ edition = "2024"
 description = "External platform integrations MCP server for DataXLR8 — connects to LinkedIn, Seek, Indeed, XING"
 repository = "https://github.com/pdaxt/dataxlr8-integrations-mcp"
 
+
+[lib]
+name = "dataxlr8_integrations_mcp"
+path = "src/lib.rs"
 [dependencies]
 # MCP SDK
 rmcp = { version = "0.17", features = ["server", "transport-io"] }
